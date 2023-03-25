@@ -1,3 +1,10 @@
+## Fork
+提供一个快速fork 子进程并管理子进程的工具
+
+
+## Example
+
+````go
 package main
 
 import (
@@ -49,3 +56,5 @@ func main() {
 	}
 	fmt.Println("sum is :", sum)
 }
+
+````
