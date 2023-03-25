@@ -16,7 +16,7 @@ import (
 	"time"
 )
 
-type ProcFunc func(child *exec.Cmd) error
+type ProcFunc func(child *Cmd) error
 
 const (
 	ForkFlag       = "forked-child-process"
@@ -55,6 +55,8 @@ type Forker struct {
 	tf               TransportFactory
 	marshal          Marshaller
 	healthySeconds   int
+	onChildFinished  func(cmd *Cmd, err error) (createNew bool)
+	wg               sync.WaitGroup
 }
 
 func NewForker(n int) *Forker {
@@ -67,6 +69,11 @@ func NewForker(n int) *Forker {
 		done:        make(chan struct{}),
 	}
 	return f
+}
+
+// SetOnChildFinish 设置子进程结束的执行器，返回值为true 时会重新创建子进程
+func (f *Forker) SetOnChildFinish(hd func(cmd *Cmd, err error) bool) {
+	f.onChildFinished = hd
 }
 
 func (f *Forker) SetTransportFactory(tf TransportFactory) *Forker {
@@ -135,7 +142,7 @@ func (f *Forker) createChildCmd() (*Cmd, error) {
 	c.setEnv(envChildId, strconv.Itoa(int(cid)))
 
 	if f.pf != nil {
-		err = f.pf(cmd)
+		err = f.pf(c)
 		if err != nil {
 			return nil, err
 		}
@@ -145,6 +152,9 @@ func (f *Forker) createChildCmd() (*Cmd, error) {
 }
 
 func (f *Forker) RangeChild(rf func(cmd *Cmd) bool) {
+	if IsChildren() {
+		panic("range child cannot called by child process")
+	}
 	f.lock.Lock()
 	for _, cmd := range f.childrenCmd {
 		if !rf(cmd) {
@@ -154,6 +164,7 @@ func (f *Forker) RangeChild(rf func(cmd *Cmd) bool) {
 	f.lock.Unlock()
 }
 
+// SetPreForkChild 设置子进程启动前执行的函数
 func (f *Forker) SetPreForkChild(fun ProcFunc) {
 	f.pf = fun
 }
@@ -247,6 +258,10 @@ func (f *Forker) ForkProcess(doMasterPre func(f *MasterTool) error, doChild func
 	return nil
 }
 
+func (f *Forker) IsMaster() bool {
+	return !IsChildren()
+}
+
 func (f *Forker) handleSignals() {
 	sc := make(chan os.Signal, 1)
 	signal.Notify(sc, syscall.SIGTERM, syscall.SIGQUIT, syscall.SIGINT, syscall.SIGHUP)
@@ -262,8 +277,8 @@ func (f *Forker) handleSignals() {
 
 func (f *Forker) fork(n int) error {
 	res := make(chan *proc, n)
-	startProcessTime := time.Now()
-	wg := sync.WaitGroup{}
+	//startProcessTime := time.Now()
+	wg := &f.wg
 
 	for i := 0; i < n; i++ {
 		cmd, err := f.createChildCmd()
@@ -274,20 +289,20 @@ func (f *Forker) fork(n int) error {
 		if err != nil {
 			return fmt.Errorf("children cmd start error:%w", err)
 		}
+		wg.Add(1)
 
 		f.lock.Lock()
 		f.childrenCmd[cmd.id] = cmd
 		f.lock.Unlock()
-		wg.Add(1)
 
 		go func() {
 			err := cmd.cmd.Wait()
 			wg.Done()
 			//子进程30s 内推出了，说明子进程启动异常，需要立即结束进程
-			if time.Since(startProcessTime) < time.Duration(f.healthySeconds)*time.Second {
-				f.close()
-				return
-			}
+			//if time.Since(startProcessTime) < time.Duration(f.healthySeconds)*time.Second {
+			//	f.close()
+			//	return
+			//}
 
 			res <- &proc{
 				cmd: cmd,
@@ -302,6 +317,18 @@ func (f *Forker) fork(n int) error {
 		for {
 			select {
 			case p := <-res:
+				hd := f.onChildFinished
+				if hd == nil {
+					hd = func(cmd *Cmd, err error) (createNew bool) {
+						return false
+					}
+				}
+				createNew := hd(p.cmd, p.err)
+				if !createNew {
+					continue
+				}
+				// 等待1s 后再启动子进程
+				time.Sleep(1 * time.Second)
 				cmd, err := f.createChildCmd()
 				if err != nil {
 					return
@@ -330,8 +357,16 @@ func (f *Forker) fork(n int) error {
 			}
 		}
 	}()
-	wg.Wait()
+	//wg.Wait()
 	return nil
+}
+
+// Wait 会等待所有子进程执行完毕,只有主进程可以执行wait
+func (f *Forker) Wait() {
+	if IsChildren() {
+		panic("Wait cannot called by child process")
+	}
+	f.wg.Wait()
 }
 
 func (f *Forker) close() {
@@ -346,6 +381,14 @@ type Cmd struct {
 	listenFile *os.File
 	clientPip  *ClientPipe
 	f          *Forker
+}
+
+func (c *Cmd) ID() int64 {
+	return c.id
+}
+
+func (c *Cmd) Cmd() *exec.Cmd {
+	return c.cmd
 }
 
 func (c *Cmd) ClientPipe() *ClientPipe {
@@ -385,22 +428,22 @@ func (c *Cmd) childListenPort() error {
 	return nil
 }
 
-func (c *Cmd) childListenFile() error {
-	filename := childSocketDir + fmt.Sprintf("/child_%v.sock", c.id)
-	addr, err := net.ResolveUnixAddr("unix", filename)
-	if err != nil {
-		return fmt.Errorf("resolve child listen file error:%w", err)
-	}
-	ls, err := net.ListenUnix("unix", addr)
-	if err != nil {
-		return fmt.Errorf("listen child listen file error:%w", err)
-	}
-	c.listenFile, err = ls.File()
-	if err != nil {
-		return fmt.Errorf("child listen to file error:%w", err)
-	}
-	return nil
-}
+//func (c *Cmd) childListenFile() error {
+//	filename := childSocketDir + fmt.Sprintf("/child_%v.sock", c.id)
+//	addr, err := net.ResolveUnixAddr("unix", filename)
+//	if err != nil {
+//		return fmt.Errorf("resolve child listen file error:%w", err)
+//	}
+//	ls, err := net.ListenUnix("unix", addr)
+//	if err != nil {
+//		return fmt.Errorf("listen child listen file error:%w", err)
+//	}
+//	c.listenFile, err = ls.File()
+//	if err != nil {
+//		return fmt.Errorf("child listen to file error:%w", err)
+//	}
+//	return nil
+//}
 
 func (c *Cmd) setEnv(k, v string) {
 	c.cmd.Env = append(c.cmd.Env, k+"="+v)

@@ -2,6 +2,7 @@ package fork
 
 import (
 	"fmt"
+	"github.com/golang/protobuf/proto"
 	"io"
 	"net"
 	"os"
@@ -10,8 +11,21 @@ import (
 	"time"
 )
 
+type protoMarshal struct {
+}
+
+func (p protoMarshal) Decode(b []byte, v interface{}) error {
+
+	return proto.Unmarshal(b, v.(proto.Message))
+}
+
+func (p protoMarshal) Encode(v interface{}) ([]byte, error) {
+	return proto.Marshal(v.(proto.Message))
+}
+
 func TestFork(t *testing.T) {
 	f := NewForker(1)
+	f.SetTransportMarshaller(protoMarshal{})
 	err := f.ForkProcess(func(f *MasterTool) error {
 		addr, err := net.ResolveTCPAddr("tcp4", "127.0.0.1:8080")
 		if err != nil {
@@ -68,6 +82,11 @@ func TestFork(t *testing.T) {
 	if err != nil {
 		panic(err)
 	}
+	if IsChildren() {
+		return
+	}
+	f.Wait()
+
 }
 
 func TestRandfile(t *testing.T) {
@@ -75,3 +94,6 @@ func TestRandfile(t *testing.T) {
 	fmt.Println(randListenFile())
 	fmt.Println(randListenFile())
 }
+
+
+

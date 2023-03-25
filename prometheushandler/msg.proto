@@ -1,0 +1,15 @@
+syntax = "proto3";
+package prometheushandler;
+
+message request {
+  string name = 1;
+  int32 age = 2;
+}
+message response {
+  int32 code = 1;
+  string sid = 2;
+}
+
+service rpc_server {
+ rpc CreateUser(request)returns(response){}
+}
