@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"runtime"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -43,8 +44,9 @@ func IsChildren() bool {
 }
 
 type Forker struct {
-	pf               ProcFunc
-	childrenCmd      map[int64]*Cmd
+	pf ProcFunc
+	//childrenCmd map[int64]*Cmd
+	childrenCmd      childMap
 	cid              int64
 	lock             sync.Mutex
 	n                int
@@ -57,11 +59,12 @@ type Forker struct {
 	healthySeconds   int
 	onChildFinished  func(cmd *Cmd, err error) (createNew bool)
 	wg               sync.WaitGroup
+	masterTool       *MasterTool
 }
 
 func NewForker(n int) *Forker {
 	f := &Forker{
-		childrenCmd: map[int64]*Cmd{},
+		childrenCmd: childMap{},
 		cid:         0,
 		lock:        sync.Mutex{},
 		n:           n,
@@ -121,47 +124,60 @@ func (f *Forker) masterListen() error {
 }
 
 func (f *Forker) createChildCmd() (*Cmd, error) {
+	cid := atomic.AddInt64(&f.cid, 1)
+	return f.createChildCmdWithId(cid)
+}
+
+func (f *Forker) createChildCmdWithId(cid int64) (*Cmd, error) {
 	cmd := exec.Command(os.Args[0], append(os.Args[1:], forkFlag)...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
-	cid := atomic.AddInt64(&f.cid, 1)
 	c := &Cmd{
 		cmd: cmd,
 		id:  cid,
 		f:   f,
 	}
-	err := c.childListenPort()
-	if err != nil {
-		return nil, err
-	}
+	if isWindows() {
 
-	cmd.ExtraFiles = append(cmd.ExtraFiles, c.listenFile)
+	}
+	//err := c.childListenPort()
+	//if err != nil {
+	//	return nil, err
+	//}
+	//// 向master 注冊自己的通信地址
+	//out := new(registerOut)
+	//err = Call(c.ClientPipe(), serverRegisterFunc, registerIn{
+	//	ChildAddr: c.listenAddr,
+	//	ChildId:   c.id,
+	//}, out)
+	//if err != nil {
+	//	return nil, fmt.Errorf("regiser child addr to master error:%w", err)
+	//}
+
+	//cmd.ExtraFiles = append(cmd.ExtraFiles, c.listenFile)
 
 	c.setEnv(envMasterPipe, f.masterListenAddr)
 	c.setEnv(envChildId, strconv.Itoa(int(cid)))
 
 	if f.pf != nil {
-		err = f.pf(c)
+		err := f.pf(c)
 		if err != nil {
 			return nil, err
 		}
 	}
 	return c, nil
-
 }
 
 func (f *Forker) RangeChild(rf func(cmd *Cmd) bool) {
 	if IsChildren() {
-		panic("range child cannot called by child process")
+		panic("range child cannot called by master process")
 	}
-	f.lock.Lock()
-	for _, cmd := range f.childrenCmd {
-		if !rf(cmd) {
-			break
-		}
-	}
-	f.lock.Unlock()
+
+	f.childrenCmd.Range(func(id int64, cmd *Cmd) bool {
+		return rf(cmd)
+	})
+
 }
 
 // SetPreForkChild 设置子进程启动前执行的函数
@@ -186,11 +202,46 @@ func (f *Forker) newChildClientPipe() (*ClientPipe, error) {
 	return c, nil
 }
 
-func (f *Forker) createChildHandlerTooL() (*ChildrenTool, error) {
-	file := os.NewFile(3, "child listen file")
-	ls, err := net.FileListener(file)
+//func (f *Forker) createChildHandlerTooL() (*ChildrenTool, error) {
+//	file := os.NewFile(3, "child listen file")
+//	ls, err := net.FileListener(file)
+//	if err != nil {
+//		return nil, fmt.Errorf("child create file listen error:%w", err)
+//	}
+//	//创建子进程和主进程通信的桥梁
+//	st, err := f.tf.NewServerTransport(ls)
+//	if err != nil {
+//		return nil, fmt.Errorf("create child server transport error:%w", err)
+//	}
+//
+//	cp, err := f.newChildClientPipe()
+//	if err != nil {
+//		return nil, err
+//	}
+//
+//	childId, err := strconv.Atoi(os.Getenv(envChildId))
+//	if err != nil {
+//		childId = -1
+//	}
+//	return &ChildrenTool{
+//		pipe: &ServerPipe{
+//			serverTransport: st,
+//			marshaller:      f.marshal,
+//		},
+//		cliPipe: cp,
+//		childId: int64(childId),
+//	}, nil
+//}
+
+func (f *Forker) createChildHandlerTooL2() (*ChildrenTool, error) {
+	addr, err := net.ResolveTCPAddr("tcp4", "127.0.0.1:")
 	if err != nil {
-		return nil, fmt.Errorf("child create file listen error:%w", err)
+		return nil, fmt.Errorf("child resolve tcp  addr error:%w", err)
+	}
+
+	ls, err := net.ListenTCP("tcp4", addr)
+	if err != nil {
+		return nil, fmt.Errorf("child listen tcp addr error:%w", err)
 	}
 	//创建子进程和主进程通信的桥梁
 	st, err := f.tf.NewServerTransport(ls)
@@ -202,11 +253,20 @@ func (f *Forker) createChildHandlerTooL() (*ChildrenTool, error) {
 	if err != nil {
 		return nil, err
 	}
-
 	childId, err := strconv.Atoi(os.Getenv(envChildId))
 	if err != nil {
 		childId = -1
 	}
+	//像parent 注冊自己的地址
+	out := new(registerOut)
+	err = Call(cp, serverRegisterFunc, registerIn{
+		ChildAddr: addr.String(),
+		ChildId:   int64(childId),
+	}, out)
+	if err != nil {
+		return nil, fmt.Errorf("regiser child addr to master error:%w", err)
+	}
+
 	return &ChildrenTool{
 		pipe: &ServerPipe{
 			serverTransport: st,
@@ -230,11 +290,27 @@ func (f *Forker) init() {
 
 }
 
-// ForkProcess 启动主进程和子进程，如果需要从主进程传递文件到子进程，可以在doMasterPre 中设置子进程的文件，子进程获取文件需要从4开始.
+const (
+	serverRegisterFunc = "/__register"
+)
+
+type registerIn struct {
+	ChildId   int64  `json:"child_id"`
+	ChildAddr string `json:"child_addr"`
+}
+
+type registerOut struct {
+}
+
+func (f *Forker) MasterTool() *MasterTool {
+	return f.masterTool
+}
+
+// ForkProcess 启动主进程和子进程，如果需要从主进程传递文件到子进程，可以在doMasterPre 中设置子进程的文件，子进程获取文件需要从3开始.
 func (f *Forker) ForkProcess(doMasterPre func(f *MasterTool) error, doChild func(c *ChildrenTool) error) error {
 	f.init()
 	if IsChildren() {
-		t, err := f.createChildHandlerTooL()
+		t, err := f.createChildHandlerTooL2()
 		if err != nil {
 			return err
 		}
@@ -244,12 +320,28 @@ func (f *Forker) ForkProcess(doMasterPre func(f *MasterTool) error, doChild func
 		if err != nil {
 			return err
 		}
-		err = doMasterPre(&MasterTool{
+		mt := &MasterTool{
 			f: f,
-		})
+		}
+		f.masterTool = mt
+		err = doMasterPre(mt)
 		if err != nil {
 			return err
 		}
+		RegisterHandler(mt.ServerPipe(), serverRegisterFunc, func(in registerIn) (res registerOut, err error) {
+			cmd := f.childrenCmd.Get(in.ChildId)
+			if cmd == nil {
+				return res, fmt.Errorf("master cannot find chid with id %v when handle registration", in.ChildId)
+			}
+			cmd.listenAddr = in.ChildAddr
+			err = cmd.resetTransport()
+			if err != nil {
+				return res, err
+			}
+
+			return res, nil
+		})
+
 		err = f.fork(f.n)
 		if err != nil {
 			return err
@@ -268,11 +360,16 @@ func (f *Forker) handleSignals() {
 	s := <-sc
 	fmt.Println("receive sig :", s, "send signal to all children")
 	f.close()
-	f.lock.Lock()
-	for _, cmd := range f.childrenCmd {
+	//f.lock.Lock()
+	//for _, cmd := range f.childrenCmd {
+	//	cmd.cmd.Process.Signal(s)
+	//}
+	//f.lock.Unlock()
+	//
+	f.childrenCmd.Range(func(id int64, cmd *Cmd) bool {
 		cmd.cmd.Process.Signal(s)
-	}
-	f.lock.Unlock()
+		return true
+	})
 }
 
 func (f *Forker) fork(n int) error {
@@ -291,10 +388,10 @@ func (f *Forker) fork(n int) error {
 		}
 		wg.Add(1)
 
-		f.lock.Lock()
-		f.childrenCmd[cmd.id] = cmd
-		f.lock.Unlock()
-
+		//f.lock.Lock()
+		//f.childrenCmd[cmd.id] = cmd
+		//f.lock.Unlock()
+		f.childrenCmd.Put(cmd.id, cmd)
 		go func() {
 			err := cmd.cmd.Wait()
 			wg.Done()
@@ -329,7 +426,8 @@ func (f *Forker) fork(n int) error {
 				}
 				// 等待1s 后再启动子进程
 				time.Sleep(1 * time.Second)
-				cmd, err := f.createChildCmd()
+				cmd, err := f.createChildCmdWithId(p.cmd.id)
+				cmd.restartTimes = cmd.restartTimes + 1
 				if err != nil {
 					return
 				}
@@ -348,8 +446,9 @@ func (f *Forker) fork(n int) error {
 					wg.Done()
 				}()
 				f.lock.Lock()
-				f.childrenCmd[cmd.id] = cmd
-				delete(f.childrenCmd, p.cmd.id)
+				//f.childrenCmd[cmd.id] = cmd
+				//delete(f.childrenCmd, p.cmd.id)
+				f.childrenCmd.Put(cmd.id, cmd)
 				f.lock.Unlock()
 			case <-f.done:
 				return
@@ -376,11 +475,13 @@ func (f *Forker) close() {
 }
 
 type Cmd struct {
-	cmd        *exec.Cmd
-	id         int64
-	listenFile *os.File
-	clientPip  *ClientPipe
-	f          *Forker
+	cmd *exec.Cmd
+	id  int64
+	//listenFile   *os.File
+	clientPip    *ClientPipe
+	f            *Forker
+	listenAddr   string
+	restartTimes int // 重启次数
 }
 
 func (c *Cmd) ID() int64 {
@@ -403,21 +504,34 @@ func (c *Cmd) ChildrenId() int64 {
 	return c.id
 }
 
-func (c *Cmd) childListenPort() error {
-	addr, err := net.ResolveTCPAddr("tcp4", "127.0.0.1:")
-	if err != nil {
-		return fmt.Errorf("child resolve tcp  addr error:%w", err)
-	}
+//func (c *Cmd) childListenPort() error {
+//addr, err := net.ResolveTCPAddr("tcp4", "127.0.0.1:")
+//if err != nil {
+//	return fmt.Errorf("child resolve tcp  addr error:%w", err)
+//}
+//
+//ls, err := net.ListenTCP("tcp4", addr)
+//if err != nil {
+//	return fmt.Errorf("child listen tcp addr error:%w", err)
+//}
+//c.listenAddr = ls.Addr().String()
+//c.listenFile, err = ls.File()
+//if err != nil {
+//	return fmt.Errorf("child tcp file error:%w", err)
+//}
+//ct, err := c.f.tf.NewClientTransport(ls.Addr().String())
+//if err != nil {
+//	return fmt.Errorf("child creat client transport error:%w", err)
+//}
+//c.clientPip = &ClientPipe{
+//	clientTransport: ct,
+//	marshaller:      c.f.marshal,
+//}
+//return nil
+//}
 
-	ls, err := net.ListenTCP("tcp4", addr)
-	if err != nil {
-		return fmt.Errorf("child listen tcp addr error:%w", err)
-	}
-	c.listenFile, err = ls.File()
-	if err != nil {
-		return fmt.Errorf("child tcp file error:%w", err)
-	}
-	ct, err := c.f.tf.NewClientTransport(ls.Addr().String())
+func (c *Cmd) resetTransport() error {
+	ct, err := c.f.tf.NewClientTransport(c.listenAddr)
 	if err != nil {
 		return fmt.Errorf("child creat client transport error:%w", err)
 	}
@@ -458,4 +572,30 @@ func randListenFile() string {
 	src := make([]byte, 16)
 	_, _ = rand.Read(src)
 	return hex.EncodeToString(src)
+}
+
+func isWindows() bool {
+	return runtime.GOOS == "windows"
+}
+
+type childMap struct {
+	m sync.Map
+}
+
+func (c *childMap) Put(id int64, cmd *Cmd) {
+	c.m.Store(id, cmd)
+}
+
+func (c *childMap) Get(id int64) *Cmd {
+	child, ok := c.m.Load(id)
+	if !ok {
+		return nil
+	}
+	return child.(*Cmd)
+}
+
+func (c *childMap) Range(f func(id int64, cmd *Cmd) bool) {
+	c.m.Range(func(key, value any) bool {
+		return f(key.(int64), value.(*Cmd))
+	})
 }

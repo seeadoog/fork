@@ -1,5 +1,7 @@
 package fork
 
+import "fmt"
+
 type ServerPipe struct {
 	serverTransport ServerTransport
 	marshaller      Marshaller
@@ -27,6 +29,9 @@ func RegisterHandler[In any, Out any](p *ServerPipe, fun string, handler func(in
 }
 
 func Call(p *ClientPipe, fun string, in interface{}, out interface{}) error {
+	if p == nil {
+		return fmt.Errorf("client pipe is nil ,may not ready")
+	}
 	input, err := p.marshaller.Encode(in)
 	if err != nil {
 		return err

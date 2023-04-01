@@ -1,9 +1,10 @@
 package fork
 
 type ChildrenTool struct {
-	pipe    *ServerPipe
-	cliPipe *ClientPipe
-	childId int64
+	pipe       *ServerPipe
+	cliPipe    *ClientPipe
+	childId    int64
+	listenAddr string
 }
 
 func (c *ChildrenTool) ServePipe() *ServerPipe {
